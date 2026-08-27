@@ -61,23 +61,24 @@ Weekly (all models): 28% · resets Sun 2:59 PM
 Install the binary somewhere stable and register a launchd agent:
 
 ```sh
-cp target/release/claude-usage-bar /usr/local/bin/
+mkdir -p ~/.local/bin
+cp target/release/claude-usage-bar ~/.local/bin/
 
-cat > ~/Library/LaunchAgents/com.claude-usage-bar.plist <<'EOF'
+cat > ~/Library/LaunchAgents/com.claude-usage-bar.plist <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.claude-usage-bar</string>
-  <key>ProgramArguments</key><array><string>/usr/local/bin/claude-usage-bar</string></array>
+  <key>ProgramArguments</key><array><string>$HOME/.local/bin/claude-usage-bar</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 </dict></plist>
 EOF
 
-launchctl load ~/Library/LaunchAgents/com.claude-usage-bar.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.claude-usage-bar.plist
 ```
 
-To stop it: `launchctl unload ~/Library/LaunchAgents/com.claude-usage-bar.plist`.
+To stop it: `launchctl bootout gui/$(id -u)/com.claude-usage-bar`.
 
 ## Architecture
 
