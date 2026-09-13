@@ -1,18 +1,21 @@
 # claude-usage-bar
 
-A tiny native macOS **menu bar widget** that shows your Claude usage limits at a glance — the **5-hour session** and the **weekly** limit — with countdowns to each reset. Written in Rust. No telemetry, no dependencies beyond the binary.
+A tiny native macOS **menu bar widget** that shows **every** Claude usage limit at a glance — the current **5-hour session**, the **weekly cap across all models**, and any **per-model weekly cap** your plan has (Fable, Opus, …) — each with a countdown to its reset. Written in Rust. No telemetry, no dependencies beyond the binary.
 
 ```
-🟢 12% · 28%        ← menu bar title: 5-hour · weekly
-🟠 53% · 28%        ← orange at ≥50% on either limit
-🔴 91% · 74%        ← red at ≥80%
+🟢 5h 12% · 7d 28% · Fable 4%     ← menu bar title
+🟠 5h 53% · 7d 28% · Fable 61%    ← orange at ≥50% on any limit
+🔴 5h 3%  · 7d 75% · Fable 100%   ← red at ≥80% on any limit
 ```
+
+The dot reflects the **worst** limit, not just the session — a maxed-out per-model cap turns it red even when the session is nearly idle.
 
 Clicking the item opens a dropdown with the details:
 
 ```
-5-hour session: 53% · resets in 3h 12m
-Weekly (all models): 28% · resets Sun 2:59 PM
+🟢 Current session: 3% · resets in 4h 55m
+🟠 All models: 75% · resets in 5h 35m
+🔴 Fable (weekly): 100% · resets in 5h 35m
 ────────────────────────────
 Updated 9:47 AM
 Refresh Now
@@ -20,6 +23,8 @@ Open claude.ai Usage Page
 ────────────────────────────
 Quit Claude Usage Bar
 ```
+
+The rows are built from whatever the API reports, so a new per-model cap appears on its own without a code change.
 
 This is a Rust/macOS port of the excellent [Defacedz/claude-usage-widget](https://github.com/Defacedz/claude-usage-widget) (C#/WPF for Windows, with a Swift variant), which pioneered the approach. MIT-licensed like the original.
 
@@ -29,7 +34,9 @@ The widget rides on your existing **Claude Code** login — you must be signed i
 
 1. **Credentials** — reads the Claude Code OAuth token from the login keychain (generic password `"Claude Code-credentials"`, via `/usr/bin/security`), falling back to `~/.claude/.credentials.json` if present.
 2. **Token refresh** — when the access token is near expiry, it refreshes it against `platform.claude.com` / `console.anthropic.com` using Claude Code's own client ID, and **writes the rotated tokens back** to the keychain so Claude Code stays logged in.
-3. **Usage** — polls `https://api.anthropic.com/api/oauth/usage` (the same endpoint the Claude apps use) every 5 minutes, which returns `utilization` (percent) and `resets_at` for the `five_hour` and `seven_day` limits (plus a separate Opus weekly limit on plans that have one — shown automatically when present).
+3. **Usage** — polls `https://api.anthropic.com/api/oauth/usage` (the same endpoint the Claude apps use) every 5 minutes and reads its `limits` array, which carries a `percent`, `severity` and `resets_at` for each limit in force: `session`, `weekly_all`, and one `weekly_scoped` entry per model-specific cap (the model name comes from `scope.model.display_name`). If a response arrives without a `limits` array, it falls back to the older top-level `five_hour` / `seven_day` / `seven_day_opus` keys.
+
+   > Per-model caps live **only** in the `limits` array — they have no top-level key. Reading just the top-level keys hides them, which is how a maxed-out model cap can go unnoticed until it bites.
 
 Your token is sent to `api.anthropic.com`, `platform.claude.com` and `console.anthropic.com` — nowhere else. Nothing is logged or uploaded.
 
@@ -52,8 +59,9 @@ Handy for scripts or debugging:
 
 ```sh
 $ claude-usage-bar --once
-5-hour session: 53% · resets in 3h 12m
-Weekly (all models): 28% · resets Sun 2:59 PM
+🟢 Current session: 3% · resets in 4h 55m
+🟠 All models: 75% · resets in 5h 35m
+🔴 Fable (weekly): 100% · resets in 5h 35m
 ```
 
 ### Start at login

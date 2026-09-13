@@ -1,5 +1,6 @@
-// claude-usage-bar — macOS menu bar widget showing Claude's 5-hour session
-// and weekly usage limits, with reset countdowns.
+// claude-usage-bar — macOS menu bar widget showing Claude's usage limits: the
+// current 5-hour session, the weekly cap across all models, and any per-model
+// weekly caps the account has (Fable, Opus, …), each with a reset countdown.
 //
 // Reads the Claude Code OAuth token from the login keychain (generic password
 // "Claude Code-credentials", via /usr/bin/security) with a fallback to
@@ -32,22 +33,56 @@ const TOKEN_URLS: [&str; 2] = [
 ];
 const POLL_INTERVAL: Duration = Duration::from_secs(300);
 
-#[derive(Clone, Debug, Default)]
-struct LimitInfo {
-    utilization: Option<f64>,
+/// One usage limit as reported by the API.
+#[derive(Clone, Debug)]
+struct Limit {
+    /// Full name for the dropdown, e.g. "All models".
+    label: String,
+    /// Compact name for the menu bar title, e.g. "7d".
+    short: String,
+    percent: f64,
+    /// The API's own "normal" / "warning" / "critical" call, when present.
+    severity: Option<String>,
     resets_at: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
-struct Usage {
-    five_hour: Option<LimitInfo>,
-    seven_day: Option<LimitInfo>,
-    seven_day_opus: Option<LimitInfo>,
+impl Limit {
+    /// 0 = fine, 1 = warning, 2 = critical. Takes the worse of the server's
+    /// severity and our own thresholds so we never under-warn.
+    fn rank(&self) -> u8 {
+        let from_severity = match self.severity.as_deref() {
+            Some("critical") | Some("exceeded") => 2,
+            Some("warning") => 1,
+            _ => 0,
+        };
+        let from_percent = if self.percent >= 80.0 {
+            2
+        } else if self.percent >= 50.0 {
+            1
+        } else {
+            0
+        };
+        from_severity.max(from_percent)
+    }
+
+    fn title_part(&self) -> String {
+        format!("{} {:.0}%", self.short, self.percent)
+    }
+
+    fn menu_line(&self) -> String {
+        format!(
+            "{} {}: {:.0}%{}",
+            dot(self.rank()),
+            self.label,
+            self.percent,
+            fmt_reset(&self.resets_at)
+        )
+    }
 }
 
 enum UserEvent {
     Menu(MenuEvent),
-    Usage(Result<Usage, String>),
+    Usage(Result<Vec<Limit>, String>),
 }
 
 // ---------- credentials (login keychain, via /usr/bin/security) ----------
@@ -195,7 +230,83 @@ fn access_token(agent: &ureq::Agent) -> Result<String, String> {
     Ok(access) // last resort, same as the Windows/Swift widgets
 }
 
-fn fetch_usage(agent: &ureq::Agent) -> Result<Usage, String> {
+/// Turn "weekly_scoped" into "Weekly scoped", for limit kinds we don't know.
+fn humanize(kind: &str) -> String {
+    let spaced = kind.replace('_', " ");
+    let mut c = spaced.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => "Limit".into(),
+    }
+}
+
+/// The `limits` array is the current shape of the response and is the only
+/// place per-model caps (Fable, Opus, …) show up — they arrive as
+/// `weekly_scoped` entries carrying `scope.model.display_name`, with no
+/// matching top-level key. Reading only the top-level keys silently hides
+/// them, which is how a maxed-out model cap can go unnoticed.
+fn parse_limits(v: &Value) -> Vec<Limit> {
+    let Some(arr) = v.get("limits").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|l| {
+            let percent = l.get("percent").and_then(Value::as_f64)?;
+            let kind = l.get("kind").and_then(Value::as_str).unwrap_or("");
+            let model = l
+                .pointer("/scope/model/display_name")
+                .and_then(Value::as_str);
+            let (label, short) = match kind {
+                "session" => ("Current session".to_string(), "5h".to_string()),
+                "weekly_all" => ("All models".to_string(), "7d".to_string()),
+                _ => match model {
+                    Some(m) => (format!("{m} (weekly)"), m.to_string()),
+                    None => (humanize(kind), humanize(kind)),
+                },
+            };
+            Some(Limit {
+                label,
+                short,
+                percent,
+                severity: l
+                    .get("severity")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                resets_at: l
+                    .get("resets_at")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+            })
+        })
+        .collect()
+}
+
+/// Fallback for responses without a `limits` array: the older top-level keys.
+fn parse_legacy_limits(v: &Value) -> Vec<Limit> {
+    [
+        ("five_hour", "Current session", "5h"),
+        ("seven_day", "All models", "7d"),
+        ("seven_day_opus", "Opus (weekly)", "Opus"),
+        ("seven_day_sonnet", "Sonnet (weekly)", "Sonnet"),
+    ]
+    .iter()
+    .filter_map(|(key, label, short)| {
+        let o = v.get(key)?.as_object()?;
+        Some(Limit {
+            label: label.to_string(),
+            short: short.to_string(),
+            percent: o.get("utilization").and_then(Value::as_f64)?,
+            severity: None,
+            resets_at: o
+                .get("resets_at")
+                .and_then(Value::as_str)
+                .map(String::from),
+        })
+    })
+    .collect()
+}
+
+fn fetch_usage(agent: &ureq::Agent) -> Result<Vec<Limit>, String> {
     let token = access_token(agent)?;
     let resp = agent
         .get(USAGE_URL)
@@ -209,39 +320,23 @@ fn fetch_usage(agent: &ureq::Agent) -> Result<Usage, String> {
     let v: Value = resp
         .into_json()
         .map_err(|_| "bad response from usage endpoint".to_string())?;
-    let limit = |key: &str| -> Option<LimitInfo> {
-        let o = v.get(key)?.as_object()?;
-        Some(LimitInfo {
-            utilization: o.get("utilization").and_then(Value::as_f64),
-            resets_at: o
-                .get("resets_at")
-                .and_then(Value::as_str)
-                .map(String::from),
-        })
+    let limits = match parse_limits(&v) {
+        l if l.is_empty() => parse_legacy_limits(&v),
+        l => l,
     };
-    Ok(Usage {
-        five_hour: limit("five_hour"),
-        seven_day: limit("seven_day"),
-        seven_day_opus: limit("seven_day_opus"),
-    })
+    if limits.is_empty() {
+        return Err("usage endpoint reported no limits".into());
+    }
+    Ok(limits)
 }
 
 // ---------- formatting ----------
 
-fn fmt_pct(v: Option<f64>) -> String {
-    match v {
-        Some(v) => format!("{:.0}%", v),
-        None => "–".into(),
-    }
-}
-
-fn dot(worst: f64) -> &'static str {
-    if worst >= 80.0 {
-        "🔴"
-    } else if worst >= 50.0 {
-        "🟠"
-    } else {
-        "🟢"
+fn dot(rank: u8) -> &'static str {
+    match rank {
+        2 => "🔴",
+        1 => "🟠",
+        _ => "🟢",
     }
 }
 
@@ -262,11 +357,11 @@ fn fmt_reset(resets_at: &Option<String>) -> String {
     }
 }
 
-fn limit_line(label: &str, l: &Option<LimitInfo>) -> String {
-    match l {
-        Some(l) => format!("{label}: {}{}", fmt_pct(l.utilization), fmt_reset(&l.resets_at)),
-        None => format!("{label}: –"),
-    }
+/// e.g. "🔴 5h 1% · 7d 75% · Fable 100%"
+fn title(limits: &[Limit]) -> String {
+    let worst = limits.iter().map(Limit::rank).max().unwrap_or(0);
+    let parts: Vec<String> = limits.iter().map(Limit::title_part).collect();
+    format!("{} {}", dot(worst), parts.join(" · "))
 }
 
 // ---------- app ----------
@@ -278,11 +373,9 @@ fn main() {
             .timeout(Duration::from_secs(25))
             .build();
         match fetch_usage(&agent) {
-            Ok(u) => {
-                println!("{}", limit_line("5-hour session", &u.five_hour));
-                println!("{}", limit_line("Weekly (all models)", &u.seven_day));
-                if u.seven_day_opus.is_some() {
-                    println!("{}", limit_line("Weekly (Opus)", &u.seven_day_opus));
+            Ok(limits) => {
+                for l in &limits {
+                    println!("{}", l.menu_line());
                 }
             }
             Err(e) => {
@@ -301,18 +394,17 @@ fn main() {
         let _ = proxy.send_event(UserEvent::Menu(event));
     }));
 
+    // The limit rows are always the first items in the menu; the list grows and
+    // shrinks with whatever the API reports, so a new per-model cap shows up on
+    // its own without a code change.
     let menu = Menu::new();
-    let item_five = MenuItem::new("5-hour session: …", false, None);
-    let item_week = MenuItem::new("Weekly (all models): …", false, None);
-    let item_opus = MenuItem::new("Weekly (Opus): …", false, None);
+    let mut limit_items: Vec<MenuItem> = vec![MenuItem::new("Loading…", false, None)];
     let item_updated = MenuItem::new("Waiting for first update…", false, None);
     let item_refresh = MenuItem::new("Refresh Now", true, None);
     let item_open = MenuItem::new("Open claude.ai Usage Page", true, None);
     let item_quit = MenuItem::new("Quit Claude Usage Bar", true, None);
     menu.append_items(&[
-        &item_five,
-        &item_week,
-        &item_opus,
+        &limit_items[0],
         &PredefinedMenuItem::separator(),
         &item_updated,
         &item_refresh,
@@ -321,7 +413,6 @@ fn main() {
         &item_quit,
     ])
     .expect("failed to build menu");
-    let mut opus_present = true; // removed from the menu if the API never reports it
 
     // Worker: fetch immediately, then every POLL_INTERVAL or when poked by Refresh.
     let (poke_tx, poke_rx) = mpsc::channel::<()>();
@@ -367,29 +458,25 @@ fn main() {
             }
 
             Event::UserEvent(UserEvent::Usage(result)) => match result {
-                Ok(u) => {
-                    let five = u.five_hour.as_ref().and_then(|l| l.utilization);
-                    let week = u.seven_day.as_ref().and_then(|l| l.utilization);
-                    let opus = u.seven_day_opus.as_ref().and_then(|l| l.utilization);
-                    let worst = five
-                        .unwrap_or(0.0)
-                        .max(week.unwrap_or(0.0))
-                        .max(opus.unwrap_or(0.0));
-                    if let Some(t) = &tray {
-                        t.set_title(Some(format!(
-                            "{} {} · {}",
-                            dot(worst),
-                            fmt_pct(five),
-                            fmt_pct(week)
-                        )));
+                Ok(limits) => {
+                    // Grow or shrink the row pool to match, then refill it.
+                    while limit_items.len() < limits.len() {
+                        let item = MenuItem::new("", false, None);
+                        let _ = menu.insert(&item, limit_items.len());
+                        limit_items.push(item);
                     }
-                    item_five.set_text(limit_line("5-hour session", &u.five_hour));
-                    item_week.set_text(limit_line("Weekly (all models)", &u.seven_day));
-                    if u.seven_day_opus.is_some() {
-                        item_opus.set_text(limit_line("Weekly (Opus)", &u.seven_day_opus));
-                    } else if opus_present {
-                        let _ = menu.remove(&item_opus);
-                        opus_present = false;
+                    while limit_items.len() > limits.len() {
+                        if let Some(item) = limit_items.pop() {
+                            let _ = menu.remove(&item);
+                        }
+                    }
+                    let lines: Vec<String> = limits.iter().map(Limit::menu_line).collect();
+                    for (item, line) in limit_items.iter().zip(&lines) {
+                        item.set_text(line);
+                    }
+                    if let Some(t) = &tray {
+                        t.set_title(Some(title(&limits)));
+                        let _ = t.set_tooltip(Some(lines.join("\n")));
                     }
                     item_updated.set_text(
                         chrono::Local::now()
